@@ -9,16 +9,8 @@ import { Download } from 'lucide-react';
 const NO_STUDY = 'No Study';
 
 export function StudyLog() {
-  const [sessions, setSessions] = useState<StudySession[]>([]);
-  const [subjects, setSubjects] = useState<AppSubject[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [selectedDate, setSelectedDate] = useState<string>(() => {
-    const d = new Date();
-    return toYMDLocal(d);
-  });
-
   // -------------------------
-  // Timezone-safe date helpers
+  // Timezone-safe date helpers (MUST be defined BEFORE useState)
   // -------------------------
   const toYMDLocal = (d: Date) => {
     const y = d.getFullYear();
@@ -49,21 +41,31 @@ export function StudyLog() {
     const str = String(val);
     if (str.includes('T')) {
       const dt = new Date(str);
-      // create local date from the timestamp
       return toYMDLocal(new Date(dt.getFullYear(), dt.getMonth(), dt.getDate()));
     }
-    // assume already YYYY-MM-DD or similar; take first token
     return str.split(' ')[0];
   };
 
   // -------------------------
-  // Core: load data & ensure full date range
+  // State (safe to use helpers above)
+  // -------------------------
+  const [sessions, setSessions] = useState<StudySession[]>([]);
+  const [subjects, setSubjects] = useState<AppSubject[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [selectedDate, setSelectedDate] = useState<string>(() => toYMDLocal(new Date()));
+
+  // -------------------------
+  // Load data on mount
   // -------------------------
   useEffect(() => {
     loadData();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // -------------------------
+  // loadData: fetch sessions and subjects, insert missing No-Study days,
+  // recalc day_numbers and persist them.
+  // -------------------------
   const loadData = async () => {
     setLoading(true);
     try {
@@ -77,7 +79,7 @@ export function StudyLog() {
 
       const dbSubs: AppSubject[] = (subjectsRes.data || []) as AppSubject[];
 
-      // Normalize dates
+      // Normalize existing rows
       let dbSessions: StudySession[] = (sessionsRes.data || []).map((r: any) => ({
         ...r,
         entry_date: normalizeEntryDate(r.entry_date),
@@ -91,44 +93,37 @@ export function StudyLog() {
         return;
       }
 
-      // Determine earliest & latest dates
+      // earliest and latest date in DB
       const earliest = dbSessions[0].entry_date;
       const latest = dbSessions[dbSessions.length - 1].entry_date;
 
-      // Build set of existing dates
+      // set of existing dates
       const existingDateSet = new Set(dbSessions.map((s) => s.entry_date));
 
-      // Find missing dates between earliest and latest
+      // collect missing dates between earliest and latest
       const missing: string[] = [];
       for (let i = 0; i <= dateDiffDays(earliest, latest); i++) {
         const d = addDays(earliest, i);
         if (!existingDateSet.has(d)) missing.push(d);
       }
 
-      // Insert missing dates as No Study rows (one row per missing date)
+      // Insert missing No-Study rows (one per date)
       for (const d of missing) {
         const ins = await supabase
           .from('study_sessions')
-          .insert([
-            {
-              entry_date: d,
-              day_number: 0, // temporary, will recalc
-              subject: NO_STUDY,
-              hours: 0,
-              topic: '',
-            },
-          ])
+          .insert([{ entry_date: d, day_number: 0, subject: NO_STUDY, hours: 0, topic: '' }])
           .select()
           .single();
 
         if (ins.error) {
           console.error('Error inserting no-study day', d, ins.error);
         } else {
+          // push so later logic sees them (we will re-fetch below)
           dbSessions.push({ ...(ins.data as StudySession), entry_date: normalizeEntryDate((ins.data as any).entry_date) });
         }
       }
 
-      // Re-fetch to ensure we have server ids and consistent order
+      // Re-fetch to ensure we have DB ids and consistent rows
       const refreshed = await supabase.from('study_sessions').select('*').order('entry_date', { ascending: true });
       if (refreshed.error) throw refreshed.error;
       const refreshedNormalized: StudySession[] = (refreshed.data || []).map((r: any) => ({
@@ -139,10 +134,10 @@ export function StudyLog() {
       // Recalculate day numbers
       const final = recalcDayNumbers(refreshedNormalized);
 
-      // Persist day numbers if mismatch
+      // Persist day numbers if necessary
       await syncDayNumbersToDB(final);
 
-      // Update state
+      // Set state
       setSessions(final);
       setSubjects(dbSubs);
     } catch (err) {
@@ -152,34 +147,37 @@ export function StudyLog() {
     }
   };
 
-  // Recalculate day_number for every session based on distinct sorted dates
+  // -------------------------
+  // recalcDayNumbers and syncDayNumbersToDB
+  // -------------------------
   const recalcDayNumbers = (list: StudySession[]) => {
     if (!list || list.length === 0) return [];
     // distinct sorted dates
-    const dates = Array.from(new Set(list.map((s) => s.entry_date))).sort((a, b) => parseYMDToLocalDate(a).getTime() - parseYMDToLocalDate(b).getTime());
+    const dates = Array.from(new Set(list.map((s) => s.entry_date))).sort(
+      (a, b) => parseYMDToLocalDate(a).getTime() - parseYMDToLocalDate(b).getTime()
+    );
     const dateToIdx = new Map<string, number>();
     dates.forEach((d, i) => dateToIdx.set(d, i));
-    // assign
     return list.map((s) => ({ ...s, day_number: dateToIdx.get(s.entry_date)! }));
   };
 
-  // sync day_number to DB for every session (simple loop)
   const syncDayNumbersToDB = async (list: StudySession[]) => {
     try {
       for (const s of list) {
-        // update if day_number undefined or differs
-        const { error } = await supabase.from('study_sessions').update({ day_number: s.day_number, updated_at: new Date().toISOString() }).eq('id', s.id);
+        // update regardless to keep DB consistent (could optimize by checking mismatch)
+        const { error } = await supabase
+          .from('study_sessions')
+          .update({ day_number: s.day_number, updated_at: new Date().toISOString() })
+          .eq('id', s.id);
         if (error) console.error('sync day error', s.id, error);
       }
     } catch (e) {
       console.error('syncDayNumbersToDB error', e);
     }
   };
-
   // -------------------------
-  // Add session (uses selectedDate)
-  // If selectedDate currently has a No Study row -> update that row into real session
-  // Otherwise insert new row
+  // Add session for selectedDate
+  // Converts No-Study → real study if needed
   // -------------------------
   const addSessionEntry = async (subject: string, hours: number, topic: string) => {
     if (!subject || hours <= 0) {
@@ -187,29 +185,43 @@ export function StudyLog() {
       return;
     }
     try {
-      // fetch rows for that date
+      // Get rows for the selected date
       const res = await supabase.from('study_sessions').select('*').eq('entry_date', selectedDate);
       if (res.error) throw res.error;
-      const rows: StudySession[] = (res.data || []).map((r: any) => ({ ...r, entry_date: normalizeEntryDate(r.entry_date) }));
-      // if there's a No Study row, update the first one into this session
+      const rows: StudySession[] = (res.data || []).map((r: any) => ({
+        ...r,
+        entry_date: normalizeEntryDate(r.entry_date),
+      }));
+
+      // If a row is "No Study", convert it into a real session
       const noStudyRow = rows.find((r) => r.subject === NO_STUDY);
       if (noStudyRow) {
-        const { error } = await supabase.from('study_sessions').update({ subject, hours, topic, updated_at: new Date().toISOString() }).eq('id', noStudyRow.id);
+        const { error } = await supabase
+          .from('study_sessions')
+          .update({ subject, hours, topic, updated_at: new Date().toISOString() })
+          .eq('id', noStudyRow.id);
+
         if (error) {
           console.error('Error updating no-study row', error);
           alert('Failed to add session');
           return;
         }
       } else {
-        // insert a new session (day_number assigned later on reload)
-        const insert = await supabase.from('study_sessions').insert([{ entry_date: selectedDate, day_number: 0, subject, hours, topic }]).select().single();
+        // Insert a new session (recalc day_number on reload)
+        const insert = await supabase
+          .from('study_sessions')
+          .insert([{ entry_date: selectedDate, day_number: 0, subject, hours, topic }])
+          .select()
+          .single();
+
         if (insert.error) {
           console.error('Error inserting session', insert.error);
           alert('Failed to add session');
           return;
         }
       }
-      // reload entire dataset and recalc
+
+      // Reload entire dataset (fills missing dates + recalc day numbers)
       await loadData();
     } catch (err) {
       console.error('addSessionEntry error', err);
@@ -217,51 +229,61 @@ export function StudyLog() {
     }
   };
 
-  // Add session to a specific date (used by Edit Day prompt)
+  // Add a session to SPECIFIC date (for Edit Day prompt)
   const addSessionToDate = async (date: string, subject: string, hours: number, topic: string) => {
-    const prevSelected = selectedDate;
+    const prev = selectedDate;
     setSelectedDate(date);
     await addSessionEntry(subject, hours, topic);
-    setSelectedDate(prevSelected);
+    setSelectedDate(prev);
   };
 
   // -------------------------
-  // Delete one session row (by id). If after deletion, no real sessions remain for that date, ensure a No Study row exists
+  // Delete a single session row
+  // If the day becomes empty, create a No-Study entry
   // -------------------------
   const deleteSession = async (id: string) => {
     if (!confirm('Delete this entry?')) return;
+
     try {
-      // get the row first
       const getRes = await supabase.from('study_sessions').select('*').eq('id', id).single();
       if (getRes.error || !getRes.data) {
-        console.error('could not find session to delete', getRes.error);
+        console.error('Session not found', getRes.error);
         return;
       }
-      const date = normalizeEntryDate((getRes.data as any).entry_date);
-      // delete the row
+
+      const date = normalizeEntryDate(getRes.data.entry_date);
+
+      // Delete it
       const del = await supabase.from('study_sessions').delete().eq('id', id);
       if (del.error) {
-        console.error('delete session error', del.error);
+        console.error('deleteSession error', del.error);
         return;
       }
-      // check remaining rows for that date
+
+      // Check remaining rows for that date
       const check = await supabase.from('study_sessions').select('*').eq('entry_date', date);
-      if (check.error) {
-        console.error('error checking after delete', check.error);
-      } else {
-        const remaining = (check.data || []).map((r: any) => ({ ...r, entry_date: normalizeEntryDate(r.entry_date) })) as StudySession[];
-        const hasReal = remaining.some((r) => r.subject !== NO_STUDY);
-        if (!hasReal) {
-          // If no real session remains, ensure there's exactly one No Study row
-          if (remaining.length === 0) {
-            const insert = await supabase.from('study_sessions').insert([{ entry_date: date, day_number: 0, subject: NO_STUDY, hours: 0, topic: '' }]).select().single();
-            if (insert.error) console.error('Error inserting no-study after session-delete', insert.error);
-          } else {
-            // If there are No Study rows already, leave as is
-          }
+      const remaining: StudySession[] = (check.data || []).map((r: any) => ({
+        ...r,
+        entry_date: normalizeEntryDate(r.entry_date),
+      }));
+
+      const hasReal = remaining.some((r) => r.subject !== NO_STUDY);
+
+      // If NO REAL session remains → ensure exactly one No Study row exists
+      if (!hasReal) {
+        // If no rows at all, insert No Study
+        if (remaining.length === 0) {
+          const insert = await supabase
+            .from('study_sessions')
+            .insert([{ entry_date: date, day_number: 0, subject: NO_STUDY, hours: 0, topic: '' }])
+            .select()
+            .single();
+
+          if (insert.error) console.error('Error creating No-Study after deletion', insert.error);
         }
       }
-      // reload & recalc
+
+      // reload everything
       await loadData();
     } catch (err) {
       console.error('deleteSession error', err);
@@ -269,21 +291,30 @@ export function StudyLog() {
   };
 
   // -------------------------
-  // Delete entire day: clears all sessions on that date and replaces with a single No Study row
+  // Delete ENTIRE DAY
+  // Removes all rows for that date and replaces with a No-Study entry
   // -------------------------
   const deleteDay = async (date: string) => {
-    if (!confirm(`Clear all sessions for ${date}? This will convert the day to 'No Study'.`)) return;
+    if (!confirm(`Clear all sessions for ${date}? It will become a 'No Study' day.`)) return;
+
     try {
-      // delete all rows for that date
+      // Delete every row for that date
       const del = await supabase.from('study_sessions').delete().eq('entry_date', date);
       if (del.error) {
         console.error('deleteDay error', del.error);
         return;
       }
-      // insert single No Study row for that date
-      const ins = await supabase.from('study_sessions').insert([{ entry_date: date, day_number: 0, subject: NO_STUDY, hours: 0, topic: '' }]).select().single();
-      if (ins.error) console.error('insert no-study after deleteDay', ins.error);
-      // reload & recalc
+
+      // Insert a new No-Study row
+      const ins = await supabase
+        .from('study_sessions')
+        .insert([{ entry_date: date, day_number: 0, subject: NO_STUDY, hours: 0, topic: '' }])
+        .select()
+        .single();
+
+      if (ins.error) console.error('insert No-Study after deleteDay error', ins.error);
+
+      // Recalculate everything
       await loadData();
     } catch (err) {
       console.error('deleteDay error', err);
@@ -291,81 +322,102 @@ export function StudyLog() {
   };
 
   // -------------------------
-  // Edit day: quick prompt based editor for adding a single session to that day (you can replace with modal)
+  // EDIT Day
+  // (Simple prompt editor – you can later replace with a modal)
   // -------------------------
   const editDay = async (date: string) => {
-    // Simple prompt flow: subject -> hours -> topic
-    const subject = prompt('Enter subject (choose from dropdown later):', subjects[0]?.name || '');
-    if (!subject || subject.trim() === '') {
-      alert('Subject required to add session.');
-      return;
-    }
+    const subject = prompt('Enter subject:', subjects[0]?.name || '');
+    if (!subject) return;
+
     const hoursStr = prompt('Enter hours (e.g., 1.5):', '1');
     if (!hoursStr) return;
+
     const hours = parseFloat(hoursStr);
     if (isNaN(hours) || hours <= 0) {
       alert('Invalid hours');
       return;
     }
+
     const topic = prompt('Enter topic (optional):', '') || '';
+
     await addSessionToDate(date, subject.trim(), hours, topic.trim());
   };
 
   // -------------------------
-  // Subject management (same as before)
+  // Subject management
   // -------------------------
   const addSubject = async (name: string) => {
     const { data, error } = await supabase.from('app_subjects').insert([{ name }]).select().single();
     if (error) {
-      console.error('Error adding subject', error);
+      console.error('addSubject error', error);
       alert(error.message);
-    } else if (data) {
-      setSubjects((prev) => [...prev, data]);
-    }
+    } else setSubjects((p) => [...p, data]);
   };
 
   const deleteSubject = async (id: string) => {
     if (!confirm('Delete this subject?')) return;
     const { error } = await supabase.from('app_subjects').delete().eq('id', id);
-    if (error) console.error('delete subject error', error);
+    if (error) console.error('deleteSubject error', error);
     else setSubjects((p) => p.filter((s) => s.id !== id));
   };
-
   // -------------------------
-  // PDF generation - keep your template here (shortened in this example)
+  // PDF generation (simple template; replace with your full HTML if you want)
   // -------------------------
   const generatePDF = () => {
     const printWindow = window.open('', '_blank');
     if (!printWindow) return;
 
-    // Build printable HTML using sessions state (you can reuse your existing big template)
-    const sortedSessions = [...sessions].sort((a, b) => parseYMDToLocalDate(a.entry_date).getTime() - parseYMDToLocalDate(b.entry_date).getTime());
+    const sortedSessions = [...sessions].sort(
+      (a, b) => parseYMDToLocalDate(a.entry_date).getTime() - parseYMDToLocalDate(b.entry_date).getTime()
+    );
+
     const grouped = new Map<string, StudySession[]>();
     sortedSessions.forEach((s) => {
       if (!grouped.has(s.entry_date)) grouped.set(s.entry_date, []);
       grouped.get(s.entry_date)!.push(s);
     });
 
-    // Basic HTML for demo - replace with your full styled template
     const html = `
       <!doctype html>
       <html>
-        <head><meta charset="utf-8"><title>Study Log</title></head>
+        <head>
+          <meta charset="utf-8" />
+          <title>Study Log</title>
+          <style>
+            body { font-family: Arial, sans-serif; padding: 20px; color: #222; }
+            h1 { color: #2563eb; }
+            .day { margin-bottom: 18px; border-left: 4px solid #2563eb; padding: 8px 12px; background: #f8fbff; }
+            .session { margin: 6px 0; }
+            .no-study { color: #c0392b; font-weight: bold; }
+          </style>
+        </head>
         <body>
           <h1>Study Log</h1>
           ${Array.from(grouped.keys())
             .map((date) => {
-              const daySessions = grouped.get(date)!;
-              const total = daySessions.reduce((a, b) => a + (b.hours || 0), 0);
-              return `<h2>${date} — ${total.toFixed(1)} hrs</h2>
-                <ul>
-                  ${daySessions.map((s) => `<li>${s.subject} — ${s.hours} hrs ${s.topic ? `— ${s.topic}` : ''}</li>`).join('')}
-                </ul>`;
+              const items = grouped.get(date)!;
+              const total = items.reduce((a, b) => a + (b.hours || 0), 0);
+              const dayNum = items[0]?.day_number ?? '-';
+              return `
+                <div class="day">
+                  <div><strong>Day ${dayNum}</strong> — ${date} — ${total.toFixed(1)} hrs</div>
+                  <div>
+                    ${items
+                      .map((it) =>
+                        it.subject === NO_STUDY
+                          ? `<div class="session no-study">No Study (0 hrs)</div>`
+                          : `<div class="session">${it.subject} — ${it.hours} hrs ${it.topic ? `— ${it.topic}` : ''}</div>`
+                      )
+                      .join('')}
+                  </div>
+                </div>
+              `;
             })
             .join('')}
         </body>
       </html>
     `;
+
     printWindow.document.write(html);
     printWindow.document.close();
   };
@@ -392,7 +444,9 @@ export function StudyLog() {
   });
 
   // sort dates desc for UI (latest first)
-  const sortedDates = Array.from(groupedByDate.keys()).sort((a, b) => parseYMDToLocalDate(b).getTime() - parseYMDToLocalDate(a).getTime());
+  const sortedDates = Array.from(groupedByDate.keys()).sort(
+    (a, b) => parseYMDToLocalDate(b).getTime() - parseYMDToLocalDate(a).getTime()
+  );
 
   return (
     <div className="min-h-screen bg-gradient-to-br from-blue-50 to-gray-100">
@@ -417,7 +471,12 @@ export function StudyLog() {
 
           <div className="mb-6">
             <label className="block text-sm font-semibold text-gray-700 mb-2">Date</label>
-            <input type="date" value={selectedDate} onChange={(e) => setSelectedDate(e.target.value)} className="w-full px-4 py-2 border border-gray-300 rounded-lg" />
+            <input
+              type="date"
+              value={selectedDate}
+              onChange={(e) => setSelectedDate(e.target.value)}
+              className="w-full px-4 py-2 border border-gray-300 rounded-lg"
+            />
           </div>
 
           <StudyCard subjects={subjects} onAddSession={addSessionEntry} editMode={true} onDeleteSession={(id: string) => deleteSession(id)} />
@@ -446,7 +505,12 @@ export function StudyLog() {
                       <div>
                         <h3 className="text-lg font-bold text-gray-900">Day {first.day_number}</h3>
                         <p className="text-sm text-gray-600">
-                          {parseYMDToLocalDate(date).toLocaleDateString(undefined, { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' })}
+                          {parseYMDToLocalDate(date).toLocaleDateString(undefined, {
+                            weekday: 'long',
+                            year: 'numeric',
+                            month: 'long',
+                            day: 'numeric',
+                          })}
                         </p>
                       </div>
 
@@ -463,7 +527,10 @@ export function StudyLog() {
 
                     <div className="space-y-2">
                       {daySessions.map((s) => (
-                        <div key={s.id} className={`bg-white p-3 rounded border border-gray-200 flex justify-between items-start ${s.subject === NO_STUDY ? 'opacity-95' : ''}`}>
+                        <div
+                          key={s.id}
+                          className={`bg-white p-3 rounded border border-gray-200 flex justify-between items-start ${s.subject === NO_STUDY ? 'opacity-95' : ''}`}
+                        >
                           <div className="flex-1">
                             <p className="font-semibold text-gray-900">{s.subject === NO_STUDY ? 'No Study (Rest Day)' : s.subject}</p>
                             {s.topic && s.subject !== NO_STUDY && <p className="text-sm text-gray-600 italic">Topic: {s.topic}</p>}
